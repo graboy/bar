@@ -103,15 +103,18 @@ fill_rect (xcb_drawable_t d, xcb_gcontext_t gc, int x, int y, int width, int hei
 }
 
 int
-draw_char (monitor_t *mon, font_t *cur_font, int x, int align, uint16_t ch)
+draw_char (char_draw_args *draw_args, uint16_t ch)
 {
+    font_t *font = draw_args->cur_font;
+    monitor_t *mon = draw_args->cur_mon;
+    int x = draw_args->pos_x;
+
     /* In the unlikely case that the font doesn't have the glyph wanted just do nothing */
-    if (ch < cur_font->char_min || ch > cur_font->char_max)
+    if (ch < font->char_min || ch > font->char_max)
         return 0;
 
-    int ch_width = cur_font->width_lut[ch - cur_font->char_min].character_width;
-
-    switch (align) {
+    int ch_width = font->width_lut[ch - font->char_min].character_width;
+    switch (draw_args->align) {
         case ALIGN_C:
             xcb_copy_area(c, mon->pixmap, mon->pixmap, gc[GC_DRAW], mon->width / 2 - x / 2, 0,
                     mon->width / 2 - (x + ch_width) / 2, 0, x, bh);
@@ -131,7 +134,7 @@ draw_char (monitor_t *mon, font_t *cur_font, int x, int align, uint16_t ch)
     ch = (ch >> 8) | (ch << 8);
 
     /* String baseline coordinates */
-    xcb_image_text_16(c, 1, mon->pixmap, gc[GC_DRAW], x, bh / 2 + cur_font->height / 2 - cur_font->descent, (xcb_char2b_t *)&ch);
+    xcb_image_text_16(c, 1, mon->pixmap, gc[GC_DRAW], x, bh / 2 + font->height / 2 - font->descent, (xcb_char2b_t *)&ch);
 
     /* We can render both at the same time */
     if (attrs & ATTR_OVERL)
@@ -448,11 +451,7 @@ parse (char *text)
 
         xcb_change_gc(c, gc[GC_DRAW] , XCB_GC_FONT, (const uint32_t []){ draw_args.cur_font->ptr });
 
-        int w = draw_char(draw_args.cur_mon,
-                          draw_args.cur_font,
-                          draw_args.pos_x,
-                          draw_args.align,
-                          ucs);
+        int w = draw_char(&draw_args, ucs);
 
         draw_args.pos_x += w;
         area_shift(draw_args.cur_mon->window, draw_args.align, w);
