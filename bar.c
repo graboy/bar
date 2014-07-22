@@ -12,8 +12,6 @@
 #include <xcb/xinerama.h>
 #include <xcb/randr.h>
 
-// Here be dragons
-
 #define max(a,b) ((a) > (b) ? (a) : (b))
 #define min(a,b) ((a) < (b) ? (a) : (b))
 #define indexof(c,s) (strchr((s),(c))-(s))
@@ -46,6 +44,14 @@ typedef struct area_stack_t {
     area_t slot[N];
 } area_stack_t;
 
+typedef struct char_draw_args {
+    font_t    *cur_font;
+    monitor_t *cur_mon;
+    int pos_x;
+    int align;
+    int button;
+} char_draw_args;
+
 enum {
     ATTR_OVERL = (1<<0),
     ATTR_UNDERL = (1<<1),
@@ -63,6 +69,7 @@ enum {
     GC_ATTR,
     GC_MAX
 };
+
 
 static xcb_connection_t *c;
 static xcb_screen_t *scr;
@@ -290,125 +297,165 @@ area_add (char *str, const char *optend, char **end, monitor_t *mon, const int x
     a->window = mon->window;
     a->button = button;
 
-    *end = trail + 1;
+    *end = trail;
 
     return true;
+}
+
+/* returns number of characters to jump ahead in string p
+ * FIXME this might not handle international characters well
+ */
+int
+handle_control_sequence (char *p, char_draw_args *draw_args)
+{
+    uint32_t tmp;
+    char *start = p;
+
+    if (*p != '%' || *(p+1) != '{')
+        return 0;
+
+    p += 2;
+
+    /* char *end = strchrnul(p++, '}'); */
+    char *end = p;
+    while (*end != '\0' && *end != '}')
+        end++;
+
+    for ( ; p < end; p++) {
+        if (isspace(*p))
+            continue;
+
+        switch (*p++) {
+            case '+': set_attribute('+', *p++); break;
+            case '-': set_attribute('-', *p++); break;
+            case '!': set_attribute('!', *p++); break;
+
+            case 'R':
+              tmp = fgc;
+              fgc = bgc;
+              bgc = tmp;
+              update_gc();
+              break;
+
+            case 'l':
+                draw_args->pos_x = 0;
+                draw_args->align = ALIGN_L;
+                break;
+            case 'c':
+                draw_args->pos_x = 0;
+                draw_args->align = ALIGN_C;
+                break;
+            case 'r':
+                draw_args->pos_x = 0;
+                draw_args->align = ALIGN_R;
+                break;
+
+            case 'A':
+                /* TODO support multiple mouse buttons as mentioned in #66 */
+                draw_args->button = XCB_BUTTON_INDEX_1;
+
+                /* The range is 1-5 */
+                if (isdigit(*p) && (*p > '0' && *p < '6'))
+                    draw_args->button = *p++ - '0';
+
+                area_add(p, end, &p, draw_args->cur_mon,
+                                     draw_args->pos_x,
+                                     draw_args->align,
+                                     draw_args->button);
+                break;
+
+            case 'B': bgc = parse_color(p, &p, dbgc); update_gc(); break;
+            case 'F': fgc = parse_color(p, &p, dfgc); update_gc(); break;
+            case 'U': ugc = parse_color(p, &p, dbgc); update_gc(); break;
+
+            case 'S':
+                if (*p == '+' && draw_args->cur_mon->next) {
+                    draw_args->cur_mon = draw_args->cur_mon->next;
+                } else if (*p == '-' && draw_args->cur_mon->prev) {
+                    draw_args->cur_mon = draw_args->cur_mon->prev;
+                } else if (*p == 'f') {
+                    draw_args->cur_mon = monhead;
+                } else if (*p == 'l') {
+                draw_args->cur_mon = montail ? montail : monhead;
+                } else if (isdigit(*p)) {
+                    draw_args->cur_mon = monhead;
+                    for (int i = 0; i != *p-'0' && draw_args->cur_mon->next; i++)
+                        draw_args->cur_mon = draw_args->cur_mon->next;
+                }
+
+                draw_args->pos_x = 0;
+                break;
+        }
+    }
+    return (int)(end - start + 1);
 }
 
 void
 parse (char *text)
 {
-    font_t *cur_font;
-    monitor_t *cur_mon;
-    int pos_x, align, button;
-    char *p = text, *end;
-    uint32_t tmp;
+    char_draw_args draw_args = {
+        .cur_font = NULL,
+        .cur_mon = monhead,
+        .pos_x = 0,
+        .align  = ALIGN_L,
+        .button = 0
+    };
 
-    pos_x = 0;
-    align = ALIGN_L;
-    cur_mon = monhead;
+    char *p = text, *end;
 
     memset(&astack, 0, sizeof(area_stack_t));
 
     for (monitor_t *m = monhead; m != NULL; m = m->next)
         fill_rect(m->pixmap, gc[GC_CLEAR], 0, 0, m->width, bh);
 
-    for (;;) {
-        if (*p == '\0' || *p == '\n')
+    while (*p != '\0') {
+
+        int jumpahead;
+        while ((jumpahead = handle_control_sequence(p, &draw_args)) > 0)
+            p += jumpahead;
+
+        if (*p == '%' && *(p+1) == '%')
+            p++;
+
+        if (*p == '\n')
             return;
 
-        if (*p == '%' && p++ && *p == '{' && (end = strchr(p++, '}'))) {
-            while (p < end) {
-                while (isspace(*p))
-                    p++;
+        /* p now stores a character to be printed */
 
-                switch (*p++) {
-                    case '+': set_attribute('+', *p++); break;
-                    case '-': set_attribute('-', *p++); break;
-                    case '!': set_attribute('!', *p++); break;
+        /* utf-8 -> ucs-2 */
+        uint8_t *utf = (uint8_t *)p;
+        uint16_t ucs;
 
-                    case 'R':
-                              tmp = fgc;
-                              fgc = bgc;
-                              bgc = tmp;
-                              update_gc();
-                              break;
-
-                    case 'l': pos_x = 0; align = ALIGN_L; break;
-                    case 'c': pos_x = 0; align = ALIGN_C; break;
-                    case 'r': pos_x = 0; align = ALIGN_R; break;
-
-                    case 'A': 
-                              button = XCB_BUTTON_INDEX_1;
-                              /* The range is 1-5 */
-                              if (isdigit(*p) && (*p > '0' && *p < '6'))
-                                  button = *p++ - '0';
-                              area_add(p, end, &p, cur_mon, pos_x, align, button);
-                              break;
-
-                    case 'B': bgc = parse_color(p, &p, dbgc); update_gc(); break;
-                    case 'F': fgc = parse_color(p, &p, dfgc); update_gc(); break;
-                    case 'U': ugc = parse_color(p, &p, dbgc); update_gc(); break;
-
-                    case 'S':
-                              if (*p == '+' && cur_mon->next)
-                              { cur_mon = cur_mon->next; }
-                              else if (*p == '-' && cur_mon->prev)
-                              { cur_mon = cur_mon->prev; }
-                              else if (*p == 'f')
-                              { cur_mon = monhead; }
-                              else if (*p == 'l')
-                              { cur_mon = montail ? montail : monhead; }
-                              else if (isdigit(*p))
-                              { cur_mon = monhead;
-                                for (int i = 0; i != *p-'0' && cur_mon->next; i++)
-                                    cur_mon = cur_mon->next;
-                              }
-                              else
-                              { p++; continue; }
-
-                              p++;
-                              pos_x = 0;
-                              break;
-
-                    /* In case of error keep parsing after the closing } */
-                    default:
-                        p = end;
-                }
-            }
-            /* Eat the trailing } */
-            p++;
-        } else { /* utf-8 -> ucs-2 */
-            uint8_t *utf = (uint8_t *)p;
-            uint16_t ucs;
-
-            if (utf[0] < 0x80) {
-                ucs = utf[0];
-                p  += 1;
-            }
-            else if ((utf[0] & 0xe0) == 0xc0) {
-                ucs = (utf[0] & 0x1f) << 6 | (utf[1] & 0x3f);
-                p += 2;
-            }
-            else if ((utf[0] & 0xf0) == 0xe0) {
-                ucs = (utf[0] & 0xf) << 12 | (utf[1] & 0x3f) << 6 | (utf[2] & 0x3f);
-                p += 3;
-            }
-            else { /* Handle ascii > 0x80 */
-                ucs = utf[0];
-                p += 1;
-            }
-
-            /* If the character is outside the main font charset use the alternate font */
-            cur_font = (ucs < main_font->char_min || ucs > main_font->char_max) ? alt_font : main_font;
-
-            xcb_change_gc(c, gc[GC_DRAW] , XCB_GC_FONT, (const uint32_t []){ cur_font->ptr });
-
-            int w = draw_char(cur_mon, cur_font, pos_x, align, ucs);
-
-            pos_x += w;
-            area_shift(cur_mon->window, align, w);
+        if (utf[0] < 0x80) {
+            ucs = utf[0];
+            p += 1;
         }
+        else if ((utf[0] & 0xe0) == 0xc0) {
+            ucs = (utf[0] & 0x1f) << 6 | (utf[1] & 0x3f);
+            p += 2;
+        }
+        else if ((utf[0] & 0xf0) == 0xe0) {
+            ucs = (utf[0] & 0xf) << 12 | (utf[1] & 0x3f) << 6 | (utf[2] & 0x3f);
+            p += 3;
+        }
+        else { /* Handle ascii > 0x80 */
+            ucs = utf[0];
+            p += 1;
+        }
+
+        /* If the character is outside the main font charset use the alternate font */
+        draw_args.cur_font = (ucs < main_font->char_min || ucs > main_font->char_max) ? alt_font : main_font;
+
+        xcb_change_gc(c, gc[GC_DRAW] , XCB_GC_FONT, (const uint32_t []){ draw_args.cur_font->ptr });
+
+        int w = draw_char(draw_args.cur_mon,
+                          draw_args.cur_font,
+                          draw_args.pos_x,
+                          draw_args.align,
+                          ucs);
+
+        draw_args.pos_x += w;
+        area_shift(draw_args.cur_mon->window, draw_args.align, w);
     }
 }
 
